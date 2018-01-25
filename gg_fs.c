@@ -7,6 +7,12 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/gpio.h>
+#include <linux/list.h>
+#include <linux/interrupt.h>
+#include <linux/time.h>
+#include <linux/string.h>
+#include <linux/security.h>
+#include <linux/spinlock.h>
 
 MODULE_AUTHOR("Pawel Gajewski, SciTeeX Company");
 MODULE_LICENSE("GPL");
@@ -17,8 +23,12 @@ MODULE_INFO(intree, "Y");
 #define GGFS_MAGIC	0xa647361
 
 ////////////////////////////////////Data types//////////////////////////////////////////////
-enum state {low, high};
-enum direction {in, out};
+typedef enum {
+    low = 0, high = 1
+}state;
+typedef enum {
+    input, output
+}direction;
 
 // Time 
 struct cycle_time
@@ -29,20 +39,20 @@ struct cycle_time
 
 struct ggfs_gpio
 {
-    bool is_available;
-	bool is_free;
-	bool is_confirmation;
     unsigned int gpio_num;
 	unsigned int confirm_gpio;
     unsigned int irq_number;
     time_t last_event_time;
-	enum state state;
-	enum direction direction;
+	state state;
+	direction direction;
 	struct mutex mut;
+    time_t total_time;
     struct cycle_time time_list;
+    spinlock_t lock;
+    unsigned long flags;
+    struct list_head list;
 } ggfs_gpio;
 ///////////////////////////////GPIo functions//////////////////////////////////
-
 /**
  * Handlers for GPIO in input mode.
  */
@@ -78,7 +88,7 @@ static irq_handler_t ggfs_gpio_falling_handler(struct ggfs_gpio* gpio){
     //Count and add time to total time and time table.
     time_t process_time = end_time - gpio->last_event_time;
     new_time->time = process_time;
-    
+    gpio->total_time += process_time;
     //Add a list node.
     list_add_tail(&new_time->list, &gpio->time_list.list);
 
@@ -86,7 +96,7 @@ static irq_handler_t ggfs_gpio_falling_handler(struct ggfs_gpio* gpio){
     gpio->last_event_time = end_time;
     
     //Print times
-    printk(KERN_INFO "Gajos GPIO File System: Last operation time: %d msec. Total time: %d msec", process_time, total_time);
+    printk(KERN_INFO "Gajos GPIO File System: Last operation time: %u msec. Total time: %u msec", process_time, gpio->total_time);
     
     return (irq_handler_t) IRQ_HANDLED;      // Announce that the IRQ has been handled correctly
 
@@ -95,40 +105,45 @@ static irq_handler_t ggfs_gpio_falling_handler(struct ggfs_gpio* gpio){
 static irq_handler_t ggfs_gpio_irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs){
     
     //Cast dev pointer.
-    struct ggfs_gpio this_gpio = (ggfs_gpio) dev_id;
+    struct ggfs_gpio* this_gpio = (struct ggfs_gpio*)dev_id;
     
      //Set confirm gpio value.
-    bool gpio_value = gpio_get_value(this_gpio->gpio_num);
-    gpio_set_value(this_gpio->confirm_gpio, this_gpio->gpio_num);
-    
+    spin_lock_irqsave(&gpio->lock, gpio->flags);
+    int gpio_value = gpio_get_value(this_gpio->gpio_num);
+    gpio_set_value(this_gpio->confirm_gpio, gpio_value);
+
+    gpio->state = gpio_value;
     //Get IRQ flag
-    printk(KERN_INFO "Gajos GPIO File System: Interrupt on %d! Value: %d", this_gpio->gpio_num, this_gpio->confirm_gpio);
+    printk(KERN_INFO "Gajos GPIO File System: Interrupt on %d! Value: %d", this_gpio->gpio_num, gpio_value);
     irq_handler_t result;
     
-    switch(gpio_get_value(module_gpio))
+    switch(gpio_value)
     {
         case 0: result = ggfs_gpio_falling_handler(this_gpio); break;
         case 1: result = ggfs_gpio_rising_handler(this_gpio); break;
     }
-    return result;
-    
+    spin_unlock_irqrestore(&gpio->lock, gpio->flags);
+
+    return result;   
 }
 
-static int set_gpio_direction(ggfs_gpio* gpio, enum direction new_direction)
+static int set_gpio_direction(struct ggfs_gpio* gpio, direction new_direction)
 {
+    int result;
+    spin_lock_irqsave(&gpio->lock, gpio->flags);
+
     printk(KERN_ALERT "DEBUG: set_gpio_direction");
-    
     printk(KERN_ALERT "GGFS: changing state on gpio %d", gpio->gpio_num);
     
     if(new_direction == input)
     {
         char gpio_handler_name[15];
-        sprintf(gpio_handler_name, "gpio%d_handler", module_gpio);
+        sprintf(gpio_handler_name, "gpio%d_handler", gpio->gpio_num);
         
         gpio_direction_input(gpio->gpio_num);
         
         //Set handlers.
-        result = request_irq(irq_number,                                // The interrupt number requested
+        result = request_irq(gpio->irq_number,                                // The interrupt number requested
                     (irq_handler_t) ggfs_gpio_irq_handler,              // The pointer to the handler function below
                     IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,         // Interrupt on rising edge (input active)
                     gpio_handler_name,                                  // Used in /proc/interrupts to identify the owner
@@ -138,55 +153,154 @@ static int set_gpio_direction(ggfs_gpio* gpio, enum direction new_direction)
         
         //Check adding handler error.
         if(result)
+        {
+        spin_unlock_irqrestore(&gpio->lock, gpio->flags);
             return result;
+        }
     }
     else
     {
         gpio_direction_output(gpio->gpio_num,0);
-        return 0;
+        spin_unlock_irqrestore(&gpio->lock, gpio->flags);
     }
+    return 0;
+
+}
+
+static void ggfs_gpio_set_output(struct ggfs_gpio * gpio, state state)
+{
+    spin_lock_irqsave(&gpio->lock, gpio->flags);
+    gpio->state = state;
+    gpio_set_value(gpio->gpio_num, state == high);
+    gpio_set_value(gpio->confirm_gpio, state);
+    spin_unlock_irqrestore(&gpio->lock, gpio->flags);
+
+}
+
+static struct ggfs_gpio* init_gpio(unsigned int gpio_number, unsigned int confirm_gpio, unsigned int max_gpio, struct ggfs_gpio* gpio_list)
+{
+    printk(KERN_ALERT "GGFS: init_gpios");
+    struct ggfs_gpio* temp, *new_gpio;
+    list_for_each_entry(temp, &gpio_list->list, list)
+    {
+         if(temp->gpio_num == gpio_number || temp->confirm_gpio == gpio_number
+             || temp->gpio_num == confirm_gpio || temp->confirm_gpio == confirm_gpio)
+         return NULL;
+    }
+
+    if(gpio_number > max_gpio || confirm_gpio > max_gpio)
+        return NULL;
+    
+    //Check gpio.
+    if(unlikely(gpio_request(gpio_number, "ggfs")))
+    {
+        return NULL;
+    }
+    
+    if(unlikely(gpio_request(confirm_gpio, "ggfs")))
+    {
+        gpio_free(gpio_number);
+        return NULL;
+    }
+
+    //Check handlers.
+    new_gpio = kmalloc(sizeof(*new_gpio), GFP_KERNEL);
+    
+    new_gpio->gpio_num = gpio_number;
+    new_gpio->confirm_gpio = confirm_gpio;
+    
+    //Get irq number.
+    new_gpio->irq_number = gpio_to_irq(gpio_number);
+    
+    //Set direction. Init new gpio as input.
+    direction direction = input;
+
+    set_gpio_direction(new_gpio, direction);
+    
+    //Set confirm GPIO.
+    gpio_direction_output(new_gpio->confirm_gpio, gpio_get_value(new_gpio->gpio_num));
+    
+    //Init semathore.
+    mutex_init(&new_gpio->mut);
+    spin_lock_init(&new_gpio->lock);
+    
+    //Init time list.
+    new_gpio->total_time = 0;
+    INIT_LIST_HEAD(&new_gpio->time_list.list);
+    
+    //Init list head.
+    INIT_LIST_HEAD(&new_gpio->list);
+    
+    list_add(&new_gpio->list, &gpio_list->list);
+
+    printk(KERN_INFO "DEBUG: %u %u", new_gpio->gpio_num, new_gpio->confirm_gpio);
+
+    
+    return new_gpio;
+}
+
+static void release_gpio(struct ggfs_gpio* gpio)
+{
+    
+    //Release GPIOs.
+    gpio_free(gpio->gpio_num);
+    free_irq(gpio->irq_number, gpio);
+    gpio_free(gpio->confirm_gpio);
+
+    //Init list head.
+    list_del(&gpio->time_list.list);
+    
+    kfree(gpio);
     
 }
 
-static void init_gpio(ggfs_gpio* gpio, unsigned int gpio_number)
-{
-    //Check gpio.
-    if(!gpio_request(gpio_number, "ggfs"))
-    {
-        return -EPERM;
-    }
-    
-    //Check handlers.
-    
-    gpio->gpio_num = gpio_number;
-    gpio->confirm_gpio = 0;
-    
-    //Get irq number.
-    gpio->irq_number = gpio_to_irq(gpio_number);
-    
-    //Set direction
-    set_gpio_direction(gpio, input);
-    
-    //Init semathore.
-    mutex_init(&mut);
-    
-    //Init time list.
-    INIT_LIST_HEAD(&gpio->time_list.list);
-        
-}
 
 
 ///////////////////////////////File operations funcions////////////////////////
 static ssize_t value_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
+    char buffer[1];
+    
+    printk(KERN_ALERT "Buffer size: %u", len);
+    struct ggfs_gpio *gpio = file->private_data;
+    if(gpio->direction == input)
+    {
+        return -EINVAL;
+    }
+    if(len != 1)
+    {
+        return -EINVAL;
+    }
+    printk(KERN_ALERT "Before copy from user");
+    if(unlikely(copy_from_user (buffer, buf, 1)))
+    {
+        return -EFAULT;
+    }
+    printk(KERN_ALERT "After copy from user");
+    state new_state;
+    if(buffer[0] == '0')
+        new_state = low;
+    else if(buffer[0] == '1')
+        new_state = high;
+    else
+        return -EINVAL;
+    ggfs_gpio_set_output(gpio, new_state);
     return 0;
 }
 
 static ssize_t value_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-	return 0;
+    char buffer[1];
+    struct ggfs_gpio *gpio = file->private_data;
+    spin_lock(&gpio->lock);
+    int ret =  sprintf(buffer, "%i\n", gpio->state);
+    spin_unlock(&gpio->lock);
+    copy_to_user(buf, buffer, 1);
+    printk(KERN_ALERT "Buffer size: %u", len);
+
+	return ret;
 }
 
 
@@ -197,7 +311,7 @@ static int value_file_open(struct inode *inode, struct file *file)
     //Try to allocate mutex.
     if(!mutex_trylock(&gpio->mut)){
 
-      printk(KERN_ALERT "SciTeeX_GPIO: Device in use by another process");
+      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
 
       return -EBUSY;
    }
@@ -218,13 +332,48 @@ static int value_file_release(struct inode *inode, struct file *file)
 static ssize_t direction_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
-    return 0;
+    char buffer[6];
+    printk(KERN_INFO "%s", buf);
+    struct ggfs_gpio *gpio = file->private_data;
+    if(copy_from_user (buffer, buf, 6))
+    {
+        printk(KERN_INFO "Złe kopiowanie");
+        return -EFAULT;
+    }
+    if(!strcmp(buffer, "input"))
+    {
+        spin_lock(&gpio->lock);
+        set_gpio_direction(gpio, input);
+        return 0;
+    }
+    if(!strcmp(buffer, "output"))
+    {
+        set_gpio_direction(gpio, output);
+        return 0;
+    }
+    return -EINVAL;
 }
 
 static ssize_t direction_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-	return 0;
+    struct ggfs_gpio *gpio = file->private_data;
+    if(gpio->direction == output)
+    {
+        if(!copy_to_user(buf, "output", 6))
+            return 6;
+        else
+            return -EFAULT;
+    }
+    
+    if(gpio->direction == input)
+    {
+        if(!copy_to_user(buf, "input", 5))
+            return 5;
+        else
+            return -EFAULT;
+    }
+	return -EFAULT;
 }
 
 
@@ -235,7 +384,7 @@ static int direction_file_open(struct inode *inode, struct file *file)
     //Try to allocate mutex.
     if(!mutex_trylock(&gpio->mut)){
 
-      printk(KERN_ALERT "SciTeeX_GPIO: Device in use by another process");
+      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
 
       return -EBUSY;
    }
@@ -256,13 +405,29 @@ static int direction_file_release(struct inode *inode, struct file *file)
 static ssize_t total_time_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
+    char buffer[6];
+    printk(KERN_INFO "%s", buf);
+    struct ggfs_gpio *gpio = file->private_data;
+    if(copy_from_user (buffer, buf, 6))
+    
+    if(!strcmp(buf,"reset"))
+    {
+        gpio->total_time = 0;
+    }
+    
+    mutex_unlock(&gpio->mut);
+
     return 0;
 }
 
 static ssize_t total_time_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-	return -0;
+    buf = kmalloc(4*sizeof(char), GFP_KERNEL);
+	struct ggfs_gpio *gpio = (struct ggfs_gpio*)file->private_data;
+    int ret = copy_to_user(buf, &gpio->total_time, sizeof(gpio->total_time));
+    return ret;
+    
 }
 
 
@@ -273,7 +438,7 @@ static int total_time_file_open(struct inode *inode, struct file *file)
     //Try to allocate mutex.
     if(!mutex_trylock(&gpio->mut)){
 
-      printk(KERN_ALERT "SciTeeX_GPIO: Device in use by another process");
+      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
 
       return -EBUSY;
    }
@@ -306,7 +471,7 @@ static int time_list_file_open(struct inode *inode, struct file *file)
     //Try to allocate mutex.
     if(!mutex_trylock(&gpio->mut)){
 
-      printk(KERN_ALERT "SciTeeX_GPIO: Device in use by another process");
+      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
 
       return -EBUSY;
    }
@@ -338,7 +503,7 @@ static int info_file_open(struct inode *inode, struct file *file)
     //Try to allocate mutex.
     if(!mutex_trylock(&gpio->mut)){
 
-      printk(KERN_ALERT "SciTeeX_GPIO: Device in use by another process");
+      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
 
       return -EBUSY;
    }
@@ -355,6 +520,8 @@ static int info_file_release(struct inode *inode, struct file *file)
     mutex_unlock(&gpio->mut);
     
     return 0;}
+
+    
 ///////////////////////////////File operiations////////////////////////////////
 //Different file operiations for different files.
 static const struct file_operations value_file_operations = {
@@ -369,29 +536,29 @@ static const struct file_operations direction_file_operations = {
 	.llseek =	no_llseek,
 	.open =		direction_file_open,
 	.write =	direction_file_write,
-	.read =	    direction_file_read,
-	.release =	direction_file_release,
-};
+    .read =	    direction_file_read,
+    .release =	direction_file_release,
+    };
 
-static const struct file_operations total_time_file_operations = {
-	.llseek =	no_llseek,
-	.open =		total_time_file_open,
-	.write =	total_time_file_write,
-	.read =	    total_time_file_read,
-	.release =	total_time_file_release,
-};
+    static const struct file_operations total_time_file_operations = {
+        .llseek =	no_llseek,
+        .open =		total_time_file_open,
+        .write =	total_time_file_write,
+        .read =	    total_time_file_read,
+        .release =	total_time_file_release,
+    };
 
-static const struct file_operations time_list_file_operations = {
-	.llseek =	no_llseek,
-	.open =		time_list_file_open,
-	.read =	    time_list_file_read,
-	.release =	time_list_file_release,
-};
+    static const struct file_operations time_list_file_operations = {
+        .llseek =	no_llseek,
+        .open =		time_list_file_open,
+        .read =	    time_list_file_read,
+        .release =	time_list_file_release,
+    };
 
-static const struct file_operations info_file_operations = {
-	.llseek =	no_llseek,
-	.open =		info_file_open,
-	.read =	    info_file_read,
+    static const struct file_operations info_file_operations = {
+        .llseek =	no_llseek,
+        .open =		info_file_open,
+        .read =	    info_file_read,
 	.release =	info_file_release,
 };
 
@@ -406,7 +573,8 @@ enum ggfs_state {
 
 struct ggfs_sb_priv_data
 {
-	struct ggfs_gpio* gpios_table;
+	struct ggfs_gpio gpios_list;
+    struct mutex list_mut;
 	unsigned int gpios_number;
 	unsigned int used_gpios;
 } ggfs_sb_priv_data;
@@ -432,7 +600,7 @@ struct ggfs_data {
     
     	/*
 	 * File system's super block, write once when file system is
-	 * mounted.
+	 * mounted.f
 	 */
 	struct super_block		*sb;
     
@@ -447,15 +615,12 @@ struct ggfs_data {
 // Number of GPIo in device..
 static unsigned int device_gpios = 40;
 
-static unsigned int first_gpio = 1;
-
 MODULE_PARM_DESC(device_gpios, "Number of GPIOs in device");
 module_param(device_gpios, uint, S_IRUGO);
 
-MODULE_PARM_DESC(first_gpio, "Number of first GPIO in device");
-module_param(device_gpios, uint, S_IRUGO);
-////////////////////////////////////////////////////////////////////////////////////////////
 
+////////////////////////////////////////////////////////////////////////////////////////////
+//File inodes.
 static struct inode *__must_check
 ggfs_sb_make_inode(struct super_block *sb, void *data,
 		  const struct file_operations *fops,
@@ -489,19 +654,19 @@ ggfs_sb_make_inode(struct super_block *sb, void *data,
 }
 
 /* Create "regular" file */
-static struct dentry *ggfs_sb_create_file(struct super_block *sb,
-					const char *name, void *data,
+static struct dentry *ggfs_create_file(struct super_block *sb,
+					const char *name, struct dentry * parent, void *data,
 					const struct file_operations *fops)
 {
     printk(KERN_ALERT "DEBUG: ggfs_sb_create_file");
 
     //Create using GPIO.
     struct ggfs_data	*ggfs = sb->s_fs_info;
-	struct dentry	*dentry;
 	struct inode	*inode;
+    struct dentry  *dentry;
 
 
-	dentry = d_alloc_name(sb->s_root, name);
+	dentry = d_alloc_name(parent, name);
 	if (unlikely(!dentry))
 		return NULL;
 
@@ -513,6 +678,37 @@ static struct dentry *ggfs_sb_create_file(struct super_block *sb,
 	
 	d_add(dentry, inode);
 	return dentry;
+}
+
+/* Create directory as GPIO */
+static int ggfs_create_directory(struct super_block *sb,
+                     struct dentry * dentry, void *data)
+{
+    printk(KERN_ALERT "DEBUG: ggfs_sb_create_directory");
+
+    //Create using GPIO.
+    struct ggfs_data	*ggfs = sb->s_fs_info;
+	struct inode	*inode;
+
+	if (unlikely(!dentry))
+		return -1;
+    
+    
+	inode = ggfs_sb_make_inode(sb, data, &simple_dir_operations, &simple_dir_inode_operations, &ggfs->file_perms);
+	if (unlikely(!inode)) {
+		dput(dentry);
+		return -1;
+	}
+	
+	//Change to directory node.
+	inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
+    printk(KERN_INFO "DEBUG: Inode created!");
+
+    d_instantiate(dentry, inode);
+    
+    printk(KERN_INFO "DEBUG: Inode added!");
+
+	return 0;
 }
 
 /* Super block */
@@ -554,7 +750,14 @@ static void ggfs_data_clear(struct ggfs_data *ggfs)
     printk(KERN_ALERT "DEBUG: ggfs_data_clear");
 
     struct ggfs_sb_priv_data* priv_data = (struct ggfs_sb_priv_data*)ggfs->private_data;
-    kfree(priv_data->gpios_table);
+    struct ggfs_gpio * gpio, *temp;
+    mutex_lock_interruptible(&priv_data->list_mut);
+    list_for_each_entry_safe(gpio, temp, &priv_data->gpios_list.list, list)
+    {
+        release_gpio(gpio);
+    }
+    mutex_unlock(&priv_data->list_mut);
+    kfree(priv_data);
 
 }
 
@@ -576,28 +779,117 @@ static struct ggfs_sb_priv_data* ggfs_init_private_data(unsigned int gpios_numbe
     int i;
     struct ggfs_sb_priv_data * data;
     data = kmalloc(sizeof(*data), GFP_KERNEL);
-    data->gpios_table = kmalloc(sizeof(*data->gpios_table) * gpios_number,GFP_KERNEL);
-    for(i = 0; i < gpios_number; ++i)
-    {
-        init_gpio(data->gpios_table[i], first_gpio + i);
-    }
+    INIT_LIST_HEAD(&data->gpios_list.list);
     data->gpios_number = gpios_number;
     data->used_gpios = 0;
+
+    //Init mutex.
+    mutex_init(data->list_mut);
     return data;
 }
 
+//////////////////////////////////////Directory operations////////////////////
+static int ggfs_mkdir(struct inode * inode, struct dentry * dentry, umode_t umode)
+{
+    int ret;
+    printk(KERN_ALERT "DEBUG: ggfs_mkdir");
+    char* name =kstrdup(dentry->d_name.name, GFP_KERNEL);
+    printk(KERN_ALERT "%s", name);
+    unsigned int main_gpio;
+    unsigned int confirm_gpio;
+    struct ggfs_gpio * dir_gpio;
+    
+    //Check if mkdir is called in root directory.
+    if(dentry->d_parent != inode->i_sb->s_root)
+        return -EPERM;
+    
+    const char* main_gpio_s = strsep(&name, "-");
+    const char* confirm_gpio_s = kstrdup(name, GFP_KERNEL);
+
+//     if(dentry->d_parent != NULL && dentry->d_parent->d_inode == inode)
+//     {
+//         printk(KERN_ALERT "DEBUG: Inode rodzica!");
+//     }
+    
+    if(kstrtouint(main_gpio_s, 0, &main_gpio) ||kstrtouint(confirm_gpio_s, 0, &confirm_gpio))
+    {
+        return -EINVAL;
+    }
+
+    //Get data from super block.
+    struct ggfs_data	*ggfs = (struct ggfs_data*)inode->i_sb->s_fs_info;
+    
+    struct ggfs_sb_priv_data* data = (struct ggfs_sb_priv_data*)ggfs->private_data;
+    
+    mutex_lock_interruptible(&data->list_mut);
+    dir_gpio = init_gpio(main_gpio, confirm_gpio, data->gpios_number, &data->gpios_list);
+    mutex_unlock(&data->list_mut);
+    printk(KERN_INFO "DEBUG: GPIO created!");
+    
+    if(dir_gpio == NULL)
+        return -EINVAL;
+
+    ++data->used_gpios;
+    
+    printk(KERN_INFO "DEBUG: GPIO added!");
+    
+    ret = ggfs_create_directory(inode->i_sb, dentry, dir_gpio); 
+    if(ret)
+    {
+        release_gpio(dir_gpio);
+        mutex_unlock(&data->list_mut);
+        return ret;
+    }
+    printk(KERN_INFO "DEBUG: Directory created!");
+    
+     //Add files to directory node
+    ggfs_create_file(inode->i_sb,"value", dentry, dir_gpio, &value_file_operations);
+    ggfs_create_file(inode->i_sb,"direction", dentry, dir_gpio, &direction_file_operations);
+    ggfs_create_file(inode->i_sb,"total_time", dentry, dir_gpio, &total_time_file_operations);
+    ggfs_create_file(inode->i_sb,"time_list",dentry, dir_gpio, &time_list_file_operations);
+
+    printk(KERN_ALERT "DEBUG: Directory filled!");
+    
+    mutex_unlock(&data->list_mut);
+    return 0;
+}
+
+static int ggfs_rmdir (struct inode * inode,struct dentry * dentry)
+{
+    //Get data from super block.
+    struct ggfs_data	*ggfs = (struct ggfs_data*)inode->i_sb->s_fs_info;
+    
+    struct ggfs_sb_priv_data* data = (struct ggfs_sb_priv_data*)ggfs->private_data;
+    
+    struct ggfs_gpio * gpio = inode->i_private;
+    
+    list_del(&gpio->list);
+    release_gpio(gpio);
+    --data->used_gpios;
+    
+    //Relesae dentry.
+    dput(dentry);
+    
+    return 0;
+}
+
+static const struct inode_operations ggfs_root_inode_operations = {
+    .lookup = simple_lookup,
+    .mkdir = ggfs_mkdir,
+    .rmdir = ggfs_rmdir,
+};
 
 static int ggfs_sb_fill(struct super_block *sb, void *_data, int silent)
 {
     printk(KERN_ALERT "DEBUG: ggfs_sb_fill");
-
+// 
     
 	struct ggfs_sb_fill_data *data = _data;
 	struct inode	*inode;
 	struct ggfs_data	*ggfs = data->data;
 
-	ggfs->sb              = sb;
-	data->data            = NULL;
+	ggfs->sb             = sb;
+	data->data           = NULL;
 	sb->s_fs_info        = ggfs;
 	sb->s_blocksize      = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
@@ -610,7 +902,7 @@ static int ggfs_sb_fill(struct super_block *sb, void *_data, int silent)
 
 	inode = ggfs_sb_make_inode(sb, NULL,
 				  &simple_dir_operations,
-				  &simple_dir_inode_operations,
+				  &ggfs_root_inode_operations,
 				  &data->perms);
 
 	sb->s_root = d_make_root(inode);
@@ -618,12 +910,7 @@ static int ggfs_sb_fill(struct super_block *sb, void *_data, int silent)
 	if (unlikely(!sb->s_root))
 		return -ENOMEM;
 
-// 	/* EP0 file */
-    if (unlikely(!ggfs_sb_create_file(sb, "value", ggfs,
- 					 &value_file_operations)))
- 		return -ENOMEM;
-
-	return 0;
+ 	return 0;
 }
 
 static int ggfs_fs_parse_opts(struct ggfs_sb_fill_data *data, char *opts)
@@ -632,6 +919,8 @@ static int ggfs_fs_parse_opts(struct ggfs_sb_fill_data *data, char *opts)
 
         return 0;
 }
+
+
 
 static struct dentry *
 ggfs_fs_mount(struct file_system_type *t, int flags,
@@ -642,11 +931,11 @@ ggfs_fs_mount(struct file_system_type *t, int flags,
     
 	struct ggfs_sb_fill_data data = {
 		.perms = {
-			.mode = S_IFREG | 0600,
+			.mode = S_IFREG | 0766,
 			.uid = GLOBAL_ROOT_UID,
 			.gid = GLOBAL_ROOT_GID,
 		},
-		.root_mode = S_IFDIR | 0500,
+		.root_mode = S_IFDIR | 0755,
 		.no_disconnect = false,
 	};
 	struct dentry *rv;
@@ -676,6 +965,7 @@ ggfs_fs_mount(struct file_system_type *t, int flags,
 	if (IS_ERR(rv) && data.data) {
 		ggfs_data_put(data.data);
 	}
+
 	return rv;
 }
 
