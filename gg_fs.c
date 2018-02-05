@@ -21,14 +21,20 @@ MODULE_VERSION("0.3");
 MODULE_INFO(intree, "Y");
 
 #define GGFS_MAGIC	0xa647361
+#define BUF_SIZE 255
+#define DEBOUNCE 200
 
 ////////////////////////////////////Data types//////////////////////////////////////////////
 typedef enum {
     low = 0, high = 1
 }state;
+
+const char* states[] = {"low\n", "high\n"};
 typedef enum {
     input, output
 }direction;
+
+const char* directions[] = {"input\n", "output\n"};
 
 // Time 
 struct cycle_time
@@ -110,6 +116,11 @@ static irq_handler_t ggfs_gpio_irq_handler(unsigned int irq, void *dev_id, struc
     spin_lock_irqsave(&this_gpio->lock, flags);
     int gpio_value = gpio_get_value(this_gpio->gpio_num);
     gpio_set_value(this_gpio->confirm_gpio, gpio_value);
+    if(this_gpio->state == gpio_value)
+    {
+        spin_unlock_irqrestore(&this_gpio->lock, flags);
+        return (irq_handler_t) IRQ_HANDLED;
+    }
 
     this_gpio->state = gpio_value;
     //Get IRQ flag
@@ -130,10 +141,9 @@ static int set_gpio_direction(struct ggfs_gpio* gpio, direction new_direction)
 {
     int result;
     unsigned long flags;
+    
+    printk(KERN_ALERT "GGFS: changing state on gpio %d", gpio->gpio_num);    
     spin_lock_irqsave(&gpio->lock, flags);
-
-    printk(KERN_ALERT "DEBUG: set_gpio_direction");
-    printk(KERN_ALERT "GGFS: changing state on gpio %d", gpio->gpio_num);
     
     if(new_direction == input)
     {
@@ -143,25 +153,32 @@ static int set_gpio_direction(struct ggfs_gpio* gpio, direction new_direction)
         gpio_direction_input(gpio->gpio_num);
         
         //Set handlers.
+        gpio_set_debounce(gpio->gpio_num, DEBOUNCE);
+        
         result = request_irq(gpio->irq_number,                                // The interrupt number requested
                     (irq_handler_t) ggfs_gpio_irq_handler,              // The pointer to the handler function below
                     IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,         // Interrupt on rising edge (input active)
                     gpio_handler_name,                                  // Used in /proc/interrupts to identify the owner
                     gpio);
-        
-        printk(KERN_ALERT "GGFS: set_gpio_direction");
-        
+                
+        gpio->direction = input;
         //Check adding handler error.
+        
         if(result)
         {
-        spin_unlock_irqrestore(&gpio->lock, flags);
+            spin_unlock_irqrestore(&gpio->lock, flags);
             return result;
         }
+        spin_unlock_irqrestore(&gpio->lock, flags);
+        printk(KERN_ALERT "GGFS: new direction on gpio %d: input" , gpio->gpio_num);
     }
     else
     {
+        free_irq(gpio->irq_number, gpio);
+        gpio->direction = output;
         gpio_direction_output(gpio->gpio_num,0);
         spin_unlock_irqrestore(&gpio->lock,flags);
+        printk(KERN_ALERT "GGFS: new direction on gpio %d: output" , gpio->gpio_num);
     }
     return 0;
 
@@ -171,9 +188,19 @@ static void ggfs_gpio_set_output(struct ggfs_gpio * gpio, state state)
 {
     unsigned long flags;
     spin_lock_irqsave(&gpio->lock, flags);
+    if(gpio->state == state)
+    {
+        spin_unlock_irqrestore(&gpio->lock, flags);
+        return;
+    }
     gpio->state = state;
-    gpio_set_value(gpio->gpio_num, state == high);
+    gpio_set_value(gpio->gpio_num, state);
     gpio_set_value(gpio->confirm_gpio, state);
+    switch(state)
+    {
+        case low: ggfs_gpio_falling_handler(gpio); break;
+        case high: ggfs_gpio_rising_handler(gpio); break;
+    }
     spin_unlock_irqrestore(&gpio->lock, flags);
 
 }
@@ -261,57 +288,75 @@ static void release_gpio(struct ggfs_gpio* gpio)
 static ssize_t value_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
-    char buffer[1];
-    
-    printk(KERN_ALERT "Buffer size: %u", len);
     struct ggfs_gpio *gpio = file->private_data;
-    if(gpio->direction == input)
-    {
-        return -EINVAL;
-    }
-    if(len != 1)
-    {
-        return -EINVAL;
-    }
-    printk(KERN_ALERT "Before copy from user");
-    if(unlikely(copy_from_user (buffer, buf, 1)))
-    {
-        return -EFAULT;
-    }
-    printk(KERN_ALERT "After copy from user");
+    char buffer[BUF_SIZE];
+    size_t ret;
     state new_state;
-    if(buffer[0] == '0')
-        new_state = low;
-    else if(buffer[0] == '1')
+    
+    printk(KERN_INFO "GPIO %u-%u: Buffor size %u", gpio->gpio_num, gpio->confirm_gpio, len);
+    
+    if(len > BUF_SIZE)
+    {
+        return -EINVAL;
+    }
+    if(copy_from_user(buffer, buf, len) != 0)
+        return -EFAULT;
+    buffer[len] = '\0';
+
+    printk(KERN_INFO "GPIO %u-%u: Writing command: %s", gpio->gpio_num, gpio->confirm_gpio, buffer);
+    
+    if(!strcmp(buffer, "1\n"))
+    {
         new_state = high;
+        ret = 2;
+    }
+    else if(!strcmp(buffer, "0\n"))
+    {
+        new_state = low;
+        ret = 2;
+    }
+    else if(!strcmp(buffer, states[high]))
+    {
+        new_state = high;
+        ret = 5;
+    }
+    else if(!strcmp(buffer, states[low]))
+    {
+        new_state = low;
+        ret = 4;
+    }
     else
         return -EINVAL;
+    
     ggfs_gpio_set_output(gpio, new_state);
-    return 0;
+    return ret;
 }
 
 static ssize_t value_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
     unsigned long flags;
-    int ret;
-    char buffer[1];
+    ssize_t ret;
+    char buffer[2];
     struct ggfs_gpio *gpio = file->private_data;  //EOF *ptr > 1
-//     if(*ptr > 1 && len == 0)
-//     {
-      printk(KERN_INFO "GPIO %u-%u: Device is using by another process", gpio->gpio_num, gpio->confirm_gpio);
-
-//         ret = 0;
-//     }
-//     else
-//     {
-        
+    if(*ptr > 0)
+    {
+        ret = 0;
+    }
+    else
+    {
         spin_lock_irqsave(&gpio->lock,flags);
-        sprintf(buffer, "%i", gpio->state);
+        buffer[0] = '0' + gpio_get_value(gpio->gpio_num);
         spin_unlock_irqrestore(&gpio->lock,flags);
-        ret = copy_to_user(buf, buffer, 1);
-//     }
-	return 0;
+        buffer[1] = '\n';
+        if(copy_to_user(buf, buffer, 2))
+        {
+            return -EFAULT;
+        }
+        *ptr = 1;
+        ret = 2;
+    }
+	return ret;
 }
 
 
@@ -343,24 +388,44 @@ static int value_file_release(struct inode *inode, struct file *file)
 static ssize_t direction_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
-    char buffer[6];
-    printk(KERN_INFO "%s", buf);
     struct ggfs_gpio *gpio = file->private_data;
-    if(copy_from_user (buffer, buf, 6))
+
+    printk(KERN_INFO "GPIO %u-%u: Buffor size %u", gpio->gpio_num, gpio->confirm_gpio, len);
+    
+    char buffer[BUF_SIZE];
+    if(len > BUF_SIZE)
     {
-        printk(KERN_INFO "Złe kopiowanie");
+        return -EINVAL;
+    }
+    if(copy_from_user(buffer, buf, len) != 0)
         return -EFAULT;
-    }
-    if(!strcmp(buffer, "input"))
+    buffer[len] = '\0';
+
+    printk(KERN_INFO "GPIO %u-%u: Writing command: %s", gpio->gpio_num, gpio->confirm_gpio, buffer);
+
+    if(!strcmp(buffer, "input\n"))
     {
-        spin_lock(&gpio->lock);
-        set_gpio_direction(gpio, input);
-        return 0;
+        if(gpio->direction == output)
+        {
+            set_gpio_direction(gpio, input);
+            return 6;
+        }
+        else
+        {
+            return -EBADE;
+        }
     }
-    if(!strcmp(buffer, "output"))
+    if(!strcmp(buffer, "output\n"))
     {
-        set_gpio_direction(gpio, output);
-        return 0;
+        if(gpio->direction == input)
+        {
+            set_gpio_direction(gpio, output);
+            return 7;
+        }
+        else
+        {
+            return -EBADE;
+        }
     }
     return -EINVAL;
 }
@@ -368,21 +433,32 @@ static ssize_t direction_file_write(struct file *file, const char __user *buf,
 static ssize_t direction_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
+    int ret, size;
     struct ggfs_gpio *gpio = file->private_data;
+    if(*ptr > 0)
+    {
+        return 0;
+    }
     if(gpio->direction == output)
     {
-        if(!copy_to_user(buf, "output", 6))
-            return 6;
-        else
-            return -EFAULT;
+        size = strlen(directions[output]);
+        ret = copy_to_user(buf, directions[output], size);
+        if(!ret)
+        {
+            *ptr = 1;
+            return size;
+        }
     }
     
     if(gpio->direction == input)
     {
-        if(!copy_to_user(buf, "input", 5))
-            return 5;
-        else
-            return -EFAULT;
+        size = strlen(directions[input]);
+        ret = copy_to_user(buf, directions[input], size);
+        if(!ret)
+        {
+            *ptr = 1;
+            return size;
+        }
     }
 	return -EFAULT;
 }
@@ -414,29 +490,52 @@ static int direction_file_release(struct inode *inode, struct file *file)
 static ssize_t total_time_file_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *ptr)
 {
-    char buffer[6];
-    printk(KERN_INFO "%s", buf);
     struct ggfs_gpio *gpio = file->private_data;
-    if(copy_from_user (buffer, buf, 6))
+    unsigned long flags;
     
-    if(!strcmp(buf,"reset"))
+    char buffer[BUF_SIZE];
+    if(len > BUF_SIZE)
     {
-        gpio->total_time = 0;
+        return -EINVAL;
     }
-    
-    mutex_unlock(&gpio->mut);
+    if(copy_from_user(buffer, buf, len) != 0)
+        return -EFAULT;
+    buffer[len] = '\0';
 
-    return 0;
+    if(!strcmp(buffer, "reset\n"))
+    {
+        spin_lock_irqsave(&gpio->lock,flags);
+        gpio->total_time = 0;
+        spin_unlock_irqrestore(&gpio->lock,flags);
+        return 6;
+    }
+    return -EINVAL;
 }
 
 static ssize_t total_time_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-    struct ggfs_gpio *gpio = (struct ggfs_gpio*)file->private_data;
-    char * buffer;
-    int ret = copy_to_user(buf, buffer, sprintf(buffer, "%u", gpio->total_time));
-    return ret;
-    
+    unsigned long flags;
+    ssize_t ret;
+    char buffer[BUF_SIZE];
+    struct ggfs_gpio *gpio = file->private_data;  //EOF *ptr > 1
+    if(*ptr > 0)
+    {
+        ret = 0;
+    }
+    else
+    {
+        spin_lock_irqsave(&gpio->lock,flags);
+        ret = sprintf(buffer, "%u\n", gpio->total_time);
+        spin_unlock_irqrestore(&gpio->lock,flags);
+
+        if(copy_to_user(buf, buffer, ret))
+        {
+            return -EFAULT;
+        }
+        *ptr = 1;
+    }
+	return ret;
 }
 
 
@@ -466,10 +565,70 @@ static int total_time_file_release(struct inode *inode, struct file *file)
 }
 
 
+static ssize_t time_list_file_write(struct file *file, const char __user *buf,
+			     size_t len, loff_t *ptr)
+{
+    struct ggfs_gpio *gpio = file->private_data;
+    unsigned long flags;
+    struct cycle_time* temp_safe, *temp;
+
+    char buffer[BUF_SIZE];
+    if(len > BUF_SIZE)
+    {
+        return -EINVAL;
+    }
+    if(copy_from_user(buffer, buf, len) != 0)
+        return -EFAULT;
+    buffer[len] = '\0';
+
+    if(!strcmp(buffer, "reset\n"))
+    {
+        spin_lock_irqsave(&gpio->lock,flags);
+        list_for_each_entry_safe(temp, temp_safe, &gpio->time_list.list, list)
+        {
+            list_del(&temp->list);
+        }
+        spin_unlock_irqrestore(&gpio->lock,flags);
+        return 6;
+    }
+    return -EINVAL;
+}
+
 static ssize_t time_list_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-	return 0;
+    unsigned long flags;
+    ssize_t ret;
+    char buffer[BUF_SIZE];
+    struct cycle_time* last_time;
+    
+    struct ggfs_gpio *gpio = file->private_data;  //EOF *ptr > 1
+    if(*ptr > 0)
+    {
+        ret = 0;
+    }
+    else
+    {
+        spin_lock_irqsave(&gpio->lock,flags);
+        if(list_empty(&gpio->time_list.list))
+        {
+            ret = sprintf(buffer, "Time list empty!\n");
+        }
+        else
+        {
+            last_time = list_last_entry(&gpio->time_list.list, struct cycle_time, list);
+            ret = sprintf(buffer, "%u\n", last_time->time);
+            list_del(&last_time->list);
+        }
+        spin_unlock_irqrestore(&gpio->lock,flags);
+
+        if(copy_to_user(buf, buffer, ret))
+        {
+            return -EFAULT;
+        }
+        *ptr = 1;
+    }
+	return ret;
 }
 
 
@@ -498,10 +657,36 @@ static int time_list_file_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+static ssize_t info_file_write(struct file *file, const char __user *buf,
+			     size_t len, loff_t *ptr)
+{
+    return -ENOSYS;
+}
+
 static ssize_t info_file_read(struct file *file, char __user *buf,
 			    size_t len, loff_t *ptr)
 {
-	return 0;
+    unsigned long flags;
+    ssize_t ret;
+    char buffer[BUF_SIZE];
+    struct ggfs_gpio *gpio = file->private_data;  //EOF *ptr > 1
+    if(*ptr > 0)
+    {
+        ret = 0;
+    }
+    else
+    {
+        spin_lock_irqsave(&gpio->lock,flags);
+        ret = sprintf(buffer, "Main GPIO: %u\nConfirm GPIO: %u\nState: %sDirection: %s", gpio->gpio_num, gpio->confirm_gpio, states[gpio->state], directions[gpio->direction]);
+        spin_unlock_irqrestore(&gpio->lock,flags);
+
+        if(copy_to_user(buf, buffer, ret))
+        {
+            return -EFAULT;
+        }
+        *ptr = 1;
+    }
+	return ret;
 }
 
 
@@ -523,19 +708,18 @@ static int info_file_open(struct inode *inode, struct file *file)
 
 static int info_file_release(struct inode *inode, struct file *file)
 {
-
 	struct ggfs_gpio *gpio = file->private_data;
 
     mutex_unlock(&gpio->mut);
     
     return 0;
-    
 }
 
 ///////////////////////////////File operiations////////////////////////////////
 //Different file operiations for different files.
 static const struct file_operations value_file_operations = {
-	.llseek =	no_llseek,
+    .owner =    THIS_MODULE,
+	.llseek =	generic_file_llseek,
 	.open =		value_file_open,
 	.write =	value_file_write,
 	.read =	    value_file_read,
@@ -543,32 +727,38 @@ static const struct file_operations value_file_operations = {
 };
 
 static const struct file_operations direction_file_operations = {
-	.llseek =	no_llseek,
+    .owner =    THIS_MODULE,
+	.llseek =	generic_file_llseek,
 	.open =		direction_file_open,
 	.write =	direction_file_write,
     .read =	    direction_file_read,
     .release =	direction_file_release,
     };
 
-    static const struct file_operations total_time_file_operations = {
-        .llseek =	no_llseek,
-        .open =		total_time_file_open,
-        .write =	total_time_file_write,
-        .read =	    total_time_file_read,
-        .release =	total_time_file_release,
-    };
+static const struct file_operations total_time_file_operations = {
+    .owner =    THIS_MODULE,
+    .llseek =	generic_file_llseek,
+    .open =		total_time_file_open,
+    .write =	total_time_file_write,
+    .read =	    total_time_file_read,
+    .release =	total_time_file_release,
+};
 
-    static const struct file_operations time_list_file_operations = {
-        .llseek =	no_llseek,
-        .open =		time_list_file_open,
-        .read =	    time_list_file_read,
-        .release =	time_list_file_release,
-    };
+static const struct file_operations time_list_file_operations = {
+    .owner =    THIS_MODULE,
+    .llseek =	generic_file_llseek,
+    .open =		time_list_file_open,
+    .read =	    time_list_file_read,
+    .write =    time_list_file_write,
+    .release =	time_list_file_release,
+};
 
-    static const struct file_operations info_file_operations = {
-        .llseek =	no_llseek,
-        .open =		info_file_open,
-        .read =	    info_file_read,
+static const struct file_operations info_file_operations = {
+    .owner =    THIS_MODULE,
+    .llseek =	generic_file_llseek,
+    .open =		info_file_open,
+    .read =	    info_file_read,
+    .write =    info_file_write,
 	.release =	info_file_release,
 };
 
@@ -858,7 +1048,8 @@ static int ggfs_mkdir(struct inode * inode, struct dentry * dentry, umode_t umod
     ggfs_create_file(inode->i_sb,"direction", dentry, dir_gpio, &direction_file_operations);
     ggfs_create_file(inode->i_sb,"total_time", dentry, dir_gpio, &total_time_file_operations);
     ggfs_create_file(inode->i_sb,"time_list",dentry, dir_gpio, &time_list_file_operations);
-
+    ggfs_create_file(inode->i_sb,"info",dentry, dir_gpio, &info_file_operations);
+    
     printk(KERN_ALERT "DEBUG: Directory filled!");
     
     return 0;
@@ -941,7 +1132,7 @@ ggfs_fs_mount(struct file_system_type *t, int flags,
     
 	struct ggfs_sb_fill_data data = {
 		.perms = {
-			.mode = S_IFREG | 0766,
+			.mode = S_IFREG | 0666,
 			.uid = GLOBAL_ROOT_UID,
 			.gid = GLOBAL_ROOT_GID,
 		},
